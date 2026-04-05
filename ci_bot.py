@@ -6,428 +6,196 @@ import argparse
 import subprocess
 import requests
 import re
-import shutil
-from datetime import datetime, timezone
+import json
+import psutil
+from datetime import datetime
 
-# Visual Constants
 YELLOW = "\033[33m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 BOLD_GREEN = "\033[1;32m"
-RED = "\033[31m"
 
-ROOT_DIRECTORY = os.getcwd()
-
-# Attempt to detect ROM name from directory
-try:
-    ROM_NAME = os.path.basename(ROOT_DIRECTORY)
-except:
-    ROM_NAME = "Unknown"
-
-# Detect Android version from manifest
-try:
-    with open(".repo/manifests/default.xml", "r") as f:
-        content = f.read()
-        match = re.search(r'(?<=android-)[0-9]+', content)
-        ANDROID_VERSION = match.group(0) if match else "Unknown"
-except FileNotFoundError:
-    ANDROID_VERSION = "Unknown"
-
-# Config Loader
 def load_env(file_path):
     config = {}
     if not os.path.exists(file_path):
-        print(f"{RED}Error: Config file '{file_path}' not found.{RESET}")
         sys.exit(1)
-
     with open(file_path, 'r') as f:
         for line in f:
-            if line.strip().startswith('#') or not line.strip():
-                continue
-            if '=' in line:
+            if '=' in line and not line.strip().startswith('#'):
                 key, value = line.split('=', 1)
-                key = key.strip()
-                value = value.strip().strip('"').strip("'")
-
-                if value.lower() == 'true':
-                    value = True
-                elif value.lower() == 'false':
-                    value = False
-
-                config[key] = value
+                config[key.strip()] = value.strip().strip('"').strip("'")
     return config
 
-# Telegram Bot Class
-class CIBot:
-    def __init__(self, config):
-        self.config = config
-        self.base_url = f"https://api.telegram.org/bot{config['BOT_TOKEN']}"
-        self.message_id = None
+def get_progress_bar(percentage, width=25):
+    filled_len = int(width * percentage // 100)
+    bar = '#' * filled_len + '-' * (width - filled_len)
+    return f"[{bar}]"
 
-    def send_message(self, text, chat_id=None):
-        target_chat = chat_id if chat_id else self.config['CHAT_ID']
-        url = f"{self.base_url}/sendMessage"
-        data = {
-            "chat_id": target_chat,
-            "text": text,
-            "parse_mode": "html",
-            "disable_web_page_preview": True
-        }
-        try:
-            r = requests.post(url, data=data)
-            response = r.json()
-            if response.get("ok"):
-                return response["result"]["message_id"]
-        except Exception as e:
-            print(f"{RED}Failed to send message: {e}{RESET}")
-        return None
-
-    def edit_message(self, text, message_id=None, chat_id=None):
-        msg_id = message_id if message_id else self.message_id
-        target_chat = chat_id if chat_id else self.config['CHAT_ID']
-        if not msg_id:
-            return
-
-        url = f"{self.base_url}/editMessageText"
-        data = {
-            "chat_id": target_chat,
-            "message_id": msg_id,
-            "text": text,
-            "parse_mode": "html",
-            "disable_web_page_preview": True
-        }
-        try:
-            requests.post(url, data=data)
-        except Exception as e:
-            print(f"{RED}Failed to edit message: {e}{RESET}")
-
-    def send_document(self, file_path, chat_id=None):
-        target_chat = chat_id if chat_id else self.config['CHAT_ID']
-        url = f"{self.base_url}/sendDocument"
-        data = {
-            "chat_id": target_chat,
-            "parse_mode": "html",
-            "disable_web_page_preview": True
-        }
-        try:
-            with open(file_path, 'rb') as f:
-                requests.post(url, data=data, files={"document": f})
-        except Exception as e:
-            print(f"{RED}Failed to upload file: {e}{RESET}")
-
-    def pin_message(self, message_id, chat_id=None):
-        target_chat = chat_id if chat_id else self.config['CHAT_ID']
-        url = f"{self.base_url}/pinChatMessage"
-        data = {"chat_id": target_chat, "message_id": message_id}
-        try:
-            requests.post(url, data=data)
-        except Exception as e:
-            print(f"{RED}Could not pin message: {e}{RESET}")
-
-# Helper Functions
-def upload_gofile(file_path):
+def get_corefreq_data():
+    stats = {"max": 0.0, "min": 0.0, "avg": 0.0, "temp": 0, "pwr": 0}
     try:
-        with open(file_path, 'rb') as f:
-            upload_req = requests.post(
-                'https://upload.gofile.io/uploadfile',
-                files={'file': f}
-            )
-        resp = upload_req.json()
-        if resp['status'] == 'ok':
-            return resp['data']['downloadPage']
-        else:
-            return "Upload Failed"
-    except Exception as e:
-        return f"Error: {e}"
+        raw = subprocess.check_output(["corefreq-cli", "-s"], text=True, timeout=2)
+        freqs = re.findall(r'([\d\.]+)\s+MHz', raw)
+        if freqs:
+            ghz_list = [float(f)/1000 for f in freqs]
+            stats["max"] = max(ghz_list)
+            stats["min"] = min(ghz_list)
+            stats["avg"] = sum(ghz_list) / len(ghz_list)
+        temp_match = re.search(r'(?:Package|Core)\s+Temperature\s+(\d+)', raw)
+        if temp_match: stats["temp"] = int(temp_match.group(1))
+        pwr_match = re.search(r'(?:Total|Package|Energy)\s+([\d\.]+)\s+Watts', raw)
+        if pwr_match: stats["pwr"] = int(float(pwr_match.group(1)))
+    except: pass
+    return stats
 
-def upload_rclone(file_path, remote, folder):
+def get_ccache_stats():
     try:
-        cmd = ["rclone", "copy", file_path, f"{remote}:{folder}"]
-        subprocess.run(cmd, check=True)
-
-        cmd_link = ["rclone", "link", f"{remote}:{folder}/{os.path.basename(file_path)}"]
-        result = subprocess.run(cmd_link, capture_output=True, text=True)
-        return result.stdout.strip()
-    except subprocess.CalledProcessError:
-        return "Rclone Upload Failed"
-
-def fetch_progress(log_file):
-    try:
-        if not os.path.exists(log_file):
-            return None
-
-        with open(log_file, "r") as f:
-            lines = f.readlines()
-
-        for line in reversed(lines):
-            if "ninja" in line or "%" in line:
-                match = re.search(r'(\d+%) (\d+/\d+)', line)
-                if match:
-                    return f"{match.group(1)} ({match.group(2)})"
-    except Exception:
-        pass
-    return "Initializing..."
+        res = subprocess.check_output(["ccache", "-s"], text=True)
+        size_match = re.search(r'cache size\s+([\d\.]+\s\w+)\s/\s+([\d\.]+\s\w+)', res)
+        file_match = re.search(r'files in cache\s+(\d+)', res)
+        size_str = f"{size_match.group(1)} / {size_match.group(2)}" if size_match else "0.0 / 0.0 GB"
+        files_str = f"{file_match.group(1)} files" if file_match else "0 files"
+        return size_str, files_str
+    except: return "0.0 / 0.0 GB", "0 files"
 
 def format_duration(seconds):
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    if hours > 0:
-        return f"{int(hours)} hours(s) and {int(minutes)} minutes(s)"
-    return f"{int(minutes)} minutes(s) and {int(seconds)} seconds(s)"
+    m, s = divmod(int(seconds), 60)
+    return f"{m:02d}:{s:02d}"
 
-# Main Execution
-def main():
-    parser = argparse.ArgumentParser(description="Android ROM Build Bot")
-    parser.add_argument('--config', type=str, default="config.env", help="Path to config file (default: config.env)")
-    parser.add_argument('-s', '--sync', dest='sync', action='store_true', help='Sync sources')
-    parser.add_argument('-c', '--clean', dest='clean', action='store_true', help='Clean output')
-    parser.add_argument('--d-o', '--disk-optimization', dest='disk_optimization', action='store_true', help='Optimize disk')
-    args = parser.parse_args()
+class CIBot:
+    def __init__(self, config):
+        self.token = config['BOT_TOKEN']
+        self.chat_id = config['CHAT_ID']
+        self.msg_id = None
 
-    # Load Configuration
-    CONFIG = load_env(args.config)
-
-    # Validate configuration
-    required_keys = ["DEVICE", "VARIANT", "BOT_TOKEN", "CHAT_ID"]
-    for key in required_keys:
-        if key not in CONFIG or not CONFIG[key]:
-            print(f"{RED}\nERROR: Missing {key} in config file. Exiting...{RESET}\n")
-            sys.exit(1)
-
-    bot = CIBot(CONFIG)
-    cpu_count = os.cpu_count()
-    sync_jobs = 12 if cpu_count > 8 else cpu_count
-
-    now = datetime.now(timezone.utc)
-    build_datetime = str(int(now.timestamp()))
-    build_number = now.strftime("%Y%m%d00")
-
-    # 1. Disk Optimization
-    if args.disk_optimization:
-        io_script = os.path.expanduser("~/io.sh")
-        if os.path.exists(io_script):
-            subprocess.run(["bash", io_script])
+    def update_status(self, text, reply_markup=None):
+        if not self.msg_id:
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+            if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
+            r = requests.post(url, json=payload).json()
+            if r.get("ok"): self.msg_id = r["result"]["message_id"]
         else:
-            print(f"{BOLD_GREEN}Downloading and running disk optimization script...{RESET}")
-            subprocess.run("curl -s https://raw.githubusercontent.com/KanishkTheDerp/scripts/master/io.sh | bash", shell=True)
-        print(f"{BOLD_GREEN}\nDisk optimization complete.{RESET}\n")
+            url = f"https://api.telegram.org/bot{self.token}/editMessageText"
+            payload = {"chat_id": self.chat_id, "message_id": self.msg_id, "text": text, "parse_mode": "HTML"}
+            if reply_markup: payload["reply_markup"] = json.dumps(reply_markup)
+            requests.post(url, json=payload)
 
-    # 2. Syncing
-    if args.sync:
-        msg = (f"<b>Build Status: Syncing Sources</b>\n\n"
-               f"<b>ROM:</b> <code>{ROM_NAME}</code>\n"
-               f"<b>Device:</b> <code>{CONFIG['DEVICE']}</code>\n"
-               f"<b>Jobs:</b> <code>{sync_jobs} Threads</code>\n"
-               f"<b>Directory:</b> <code>{ROOT_DIRECTORY}</code>")
-
-        bot.message_id = bot.send_message(msg)
-        start_sync = time.time()
-        print(f"{BOLD_GREEN}\nStarting repo sync...{RESET}\n")
-
-        cmd_sync = f"repo sync -c -j{sync_jobs} --force-sync --no-clone-bundle --no-tags"
-        ret = subprocess.run(cmd_sync, shell=True)
-
-        if ret.returncode != 0:
-            print(f"{BOLD_GREEN}\nSync failed. Retrying with force...{RESET}")
-            ret = subprocess.run("repo sync --force-sync", shell=True)
-
-        if ret.returncode == 0:
-            duration = format_duration(time.time() - start_sync)
-            done_msg = (f"<b>Build Status: Sync Complete</b>\n\n"
-                        f"<b>ROM:</b> <code>{ROM_NAME}</code>\n"
-                        f"<b>Device:</b> <code>{CONFIG['DEVICE']}</code>\n"
-                        f"<b>Duration:</b> <code>{duration}</code>")
-            bot.edit_message(done_msg)
-        else:
-            fail_msg = (f"<b>Build Status: Sync Failed</b>\n\n"
-                        f"Attempting compilation regardless...")
-            bot.edit_message(fail_msg)
-
-    # 3. Cleaning
-    if args.clean:
-        print(f"{BOLD_GREEN}\nCleaning 'out' directory...{RESET}")
-        shutil.rmtree("out", ignore_errors=True)
-    else:
-        # Remove device out dir if -c option is not provided
-        device_out = f"out/target/product/{CONFIG['DEVICE']}"
-        print(f"{BOLD_GREEN}\nCleaning device output: {device_out}{RESET}")
-        shutil.rmtree(device_out, ignore_errors=True)
-
-    # 4. Preparation
-    for f in ["out/error.log", "out/.lock", "build.log"]:
-        if os.path.exists(f):
-            os.remove(f)
-
-    official_txt = "Official" if CONFIG.get('OFFICIAL_FLAG') else "Unofficial"
-    build_msg = (f"<b>Build Status: Compiling</b>\n\n"
-                 f"<b>ROM:</b> <code>{ROM_NAME}</code>\n"
-                 f"<b>Device:</b> <code>{CONFIG['DEVICE']}</code>\n"
-                 f"<b>Android:</b> <code>{ANDROID_VERSION}</code>\n"
-                 f"<b>Type:</b> <code>{official_txt}</code>\n"
-                 f"<b>Jobs:</b> <code>{cpu_count} Threads</code>\n"
-                 f"<b>Status:</b> <code>Initializing...</code>")
-
-    bot.message_id = bot.send_message(build_msg)
-    start_build = time.time()
-
-    print(f"{BOLD_GREEN}\nSetting up build environment and running brunch...{RESET}")
-
-    export_vars = f"export BUILD_DATETIME={build_datetime} BUILD_NUMBER={build_number}"
-    
-    build_cmd = (f"bash -c '{export_vars} && source build/envsetup.sh && {export_vars} && "
-                 f"brunch {CONFIG['DEVICE']} {CONFIG['VARIANT']}' 2>&1 | tee -a build.log")
-
-    process = subprocess.Popen(build_cmd, shell=True)
-
-    previous_prog = ""
-    while process.poll() is None:
-        current_prog = fetch_progress("build.log")
-        if current_prog and current_prog != previous_prog:
-            prog_msg = (f"<b>Build Status: Compiling</b>\n\n"
-                        f"<b>ROM:</b> <code>{ROM_NAME}</code>\n"
-                        f"<b>Device:</b> <code>{CONFIG['DEVICE']}</code>\n"
-                        f"<b>Android:</b> <code>{ANDROID_VERSION}</code>\n"
-                        f"<b>Type:</b> <code>{official_txt}</code>\n"
-                        f"<b>Jobs:</b> <code>{cpu_count} Threads</code>\n"
-                        f"<b>Progress:</b> <code>{current_prog}</code>")
-            bot.edit_message(prog_msg)
-            previous_prog = current_prog
-        time.sleep(10)
-
-    # 5. Post-Build
-    duration = format_duration(time.time() - start_build)
-
-    build_success = False
-
-    if os.path.exists("build.log"):
+    def send_document(self, file_path, caption=None):
+        url = f"https://api.telegram.org/bot{self.token}/sendDocument"
         try:
-            with open("build.log", "r", encoding="utf-8", errors="ignore") as f:
-                if "build completed successfully" in f.read():
-                    build_success = True
-        except Exception as e:
-            print(f"{YELLOW}Warning: Could not read build.log: {e}{RESET}")
+            with open(file_path, 'rb') as f:
+                payload = {"chat_id": self.chat_id, "caption": caption, "parse_mode": "HTML"}
+                requests.post(url, data=payload, files={"document": f})
+        except: pass
 
-    out_dir = f"out/target/product/{CONFIG['DEVICE']}"
-    if not build_success and os.path.exists(out_dir):
-         files = [f for f in os.listdir(out_dir) if CONFIG['DEVICE'] in f and f.endswith(".zip")]
-         if files:
-             print(f"{YELLOW}Log success message not found, but ZIP exists. Assuming success.{RESET}")
-             build_success = True
+    def pin_message(self):
+        if self.msg_id:
+            url = f"https://api.telegram.org/bot{self.token}/pinChatMessage"
+            payload = {"chat_id": self.chat_id, "message_id": self.msg_id}
+            requests.post(url, json=payload)
 
-    if not build_success:
-        fail_msg = (f"<b>Build Status: Failed</b>\n\n"
-                    f"<i>Check the attached log for details.</i>")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default="config.env")
+    args = parser.parse_args()
+    CONF = load_env(args.config)
+    bot = CIBot(CONF)
+    device = CONF.get('DEVICE', 'onyx')
+    variant = CONF.get('VARIANT', 'user')
 
-        target_error_chat = CONFIG.get('ERROR_CHAT_ID') if CONFIG.get('ERROR_CHAT_ID') else CONFIG['CHAT_ID']
-        bot.edit_message(fail_msg, chat_id=target_error_chat)
+    print(f"\n{BOLD_GREEN}--- VoltageOS Build Menu ---{RESET}")
+    print(f"1. Sync + Clean Build (m clobber)")
+    print(f"2. Sync + Installclean (m installclean)")
+    print(f"3. Sync + Standard Build")
+    choice = input(f"\n{YELLOW}{BOLD}Select option (1-3): {RESET}").strip()
 
-        if os.path.exists("out/error.log"):
-             bot.send_document("out/error.log", chat_id=target_error_chat)
+    sync_cmd = "repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags --optimized-fetch"
+    setup_env = f"source build/envsetup.sh && breakfast {device} {variant}"
+    build_target = "m bacon"
 
+    if choice == '1':
+        full_cmd = f"{sync_cmd} && {setup_env} && m clobber && {build_target}"
+        mode_label = "Sync & Clean"
+    elif choice == '2':
+        full_cmd = f"{sync_cmd} && {setup_env} && m installclean && {build_target}"
+        mode_label = "Sync & Installclean"
+    elif choice == '3':
+        full_cmd = f"{sync_cmd} && {setup_env} && {build_target}"
+        mode_label = "Standard Build"
+    else:
         sys.exit(1)
 
+    log_file = "build.log"
+    if os.path.exists(log_file): os.remove(log_file)
+    
+    start_time = time.time()
+    process = subprocess.Popen(f"bash -c '{full_cmd} 2>&1 | tee {log_file}'", shell=True)
+    
     try:
-        all_files = [f for f in os.listdir(out_dir) if CONFIG['DEVICE'] in f and f.endswith(".zip")]
+        while process.poll() is None:
+            targets, pct = "0/0", 0
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    content = f.read()
+                    match = re.findall(r'\[\s*(\d+)%\s+(\d+/\d+)\]', content)
+                    if match:
+                        pct = int(match[-1][0])
+                        targets = match[-1][1]
+            
+            core = get_corefreq_data()
+            cpu_usage = psutil.cpu_percent()
+            ram = psutil.virtual_memory()
+            cc_size, cc_files = get_ccache_stats()
+            
+            msg = (
+                f"<b>Build started for {device}</b>\n"
+                f"Mode: <code>{mode_label}</code>\n\n"
+                f"<code>[{targets}] targets ; {pct}%</code>\n"
+                f"<code>{get_progress_bar(pct)}</code>\n"
+                f"Time running: {format_duration(time.time() - start_time)} (mm:ss)\n\n"
+                f"CPU: {cpu_usage}% {core['temp']}°C {core['pwr']}W\n"
+                f"<code>{get_progress_bar(cpu_usage)}</code>\n"
+                f"GHz: ↑{core['max']:.2f} ↓{core['min']:.2f} ⨏{core['avg']:.2f}\n\n"
+                f"RAM: {ram.percent}% ({int(ram.used/1024**2)}/{int(ram.total/1024**2)} MiB)\n"
+                f"<code>{get_progress_bar(ram.percent)}</code>\n\n"
+                f"ccache: {cc_size}\n"
+                f"{cc_files}"
+            )
+            bot.update_status(msg)
+            time.sleep(5)
 
-        if not all_files:
-            raise FileNotFoundError("Build passed (log check), but no ZIP file found in output.")
-
-        main_files = [f for f in all_files if "ota" not in f.lower() and "target_files" not in f.lower()]
-
-        if main_files:
-            main_files.sort(key=lambda x: os.path.getsize(os.path.join(out_dir, x)), reverse=True)
-            rom_filename = main_files[0]
-        else:
-            all_files.sort(key=lambda x: os.path.getsize(os.path.join(out_dir, x)), reverse=True)
-            rom_filename = all_files[0]
-
-        rom_zip = os.path.join(out_dir, rom_filename)
-
-        recovery_img_path = os.path.join(out_dir, "recovery.img")
-        recovery_link = None
-        initial_link = None
-
-        print(f"{BOLD_GREEN}\nUploading files...{RESET}")
-        if os.path.exists(recovery_img_path):
-            recovery_link = upload_gofile(recovery_img_path)
-        else:
-            rom_folder = os.path.join(out_dir, "rom_temp")
-            os.makedirs(rom_folder, exist_ok=True)
-
-            required_imgs = ["vendor_boot.img", "boot.img", "dtbo.img"]
-            for img in required_imgs:
-                src = os.path.join(out_dir, img)
-                if os.path.exists(src):
-                    shutil.copy(src, rom_folder)
-
-            board_req = CONFIG.get('INITIAL_INSTALL_ZIP_DEVICES')
-            if not board_req:
-                board_req = CONFIG['DEVICE']
-
-            with open(os.path.join(rom_folder, "android-info.txt"), "w") as f:
-                f.write(f"require board={board_req}\n")
-
-            with open(os.path.join(rom_folder, "fastboot-info.txt"), "w") as f:
-                f.write("version 1\nflash boot\nflash vendor_boot\nflash dtbo\nreboot bootloader\n")
-
-            initial_zip_name = rom_zip.replace(".zip", "-initial-install.zip")
-            shutil.make_archive(initial_zip_name.replace(".zip", ""), 'zip', rom_folder)
-            shutil.rmtree(rom_folder)
-
-            initial_link = upload_gofile(initial_zip_name)
-
-        rom_link = None
-        rclone_remote = CONFIG.get('RCLONE_REMOTE')
-        rclone_folder = CONFIG.get('RCLONE_FOLDER')
-
-        if rclone_remote and rclone_folder:
-            rom_link = upload_rclone(rom_zip, rclone_remote, rclone_folder)
-        else:
-            rom_link = upload_gofile(rom_zip)
-
-        json_path = os.path.join(ROOT_DIRECTORY, "vendor", "ota", f"{CONFIG['DEVICE']}.json")
-        json_link = None
-        if os.path.exists(json_path):
-            print(f"{BOLD_GREEN}Found OTA JSON: {json_path}... Uploading.{RESET}")
-            uploaded_json = upload_gofile(json_path)
-            if "http" in str(uploaded_json):
-                json_link = uploaded_json
+        if process.returncode == 0:
+            out_dir = f"out/target/product/{device}"
+            zips = [os.path.join(out_dir, f) for f in os.listdir(out_dir) if f.endswith(".zip") and device in f and "ota" not in f.lower()]
+            if zips:
+                rom_path = max(zips, key=os.path.getmtime)
+                filename = os.path.basename(rom_path)
+                bot.update_status(f"<b>Build Success!</b>\nUploading <code>{filename}</code>...")
+                
+                user = CONF.get('REMOTE_USER')
+                host = CONF.get('REMOTE_HOST')
+                path = CONF.get('REMOTE_PATH').rstrip('/')
+                base_url = CONF.get('DOWNLOAD_URL').rstrip('/')
+                
+                try:
+                    subprocess.run(["scp", rom_path, f"{user}@{host}:{path}/"], check=True)
+                    download_url = f"{base_url}/{filename}"
+                    markup = {"inline_keyboard": [[{"text": "🚀 Download ROM", "url": download_url}]]}
+                    bot.update_status(f"<b>Build Success ✅</b>\n\nDevice: <code>{device}</code>\nMode: <code>{mode_label}</code>\nFile: <code>{filename}</code>", reply_markup=markup)
+                    bot.pin_message()
+                except Exception as e:
+                    bot.update_status(f"<b>Build Success ✅</b>\nBut upload failed: <code>{str(e)}</code>")
             else:
-                print(f"{RED}JSON upload failed: {uploaded_json}{RESET}")
-
-        md5 = subprocess.check_output(f"md5sum {rom_zip} | awk '{{print $1}}'", shell=True).decode().strip()
-        size_human = subprocess.check_output(f"ls -sh {rom_zip} | awk '{{print $1}}'", shell=True).decode().strip()
-
-        downloads = f"<a href=\"{rom_link}\">ROM</a>"
-
-        if recovery_link:
-            downloads += f" | <a href=\"{recovery_link}\">Recovery</a>"
-        elif initial_link:
-            downloads += f" | <a href=\"{initial_link}\">Initial Install</a>"
-
-        if json_link:
-            downloads += f" | <a href=\"{json_link}\">OTA JSON</a>"
-
-        success_msg = (f"<b>Build Status: Success</b>\n\n"
-                       f"<b>ROM:</b> <code>{ROM_NAME}</code>\n"
-                       f"<b>Device:</b> <code>{CONFIG['DEVICE']}</code>\n"
-                       f"<b>Android:</b> <code>{ANDROID_VERSION}</code>\n"
-                       f"<b>Type:</b> <code>{official_txt}</code>\n"
-                       f"<b>Size:</b> <code>{size_human}</code>\n"
-                       f"<b>MD5:</b> <code>{md5}</code>\n"
-                       f"<b>Duration:</b> <code>{duration}</code>\n\n"
-                       f"<b>Download:</b> {downloads}")
-
-        bot.edit_message(success_msg)
-        bot.pin_message(bot.message_id)
-
-    except Exception as e:
-        print(f"{RED}Packaging error: {e}{RESET}")
-        bot.send_message(f"Build passed but packaging failed: {e}")
-
-    if CONFIG.get('POWEROFF'):
-        print(f"{BOLD_GREEN}Shutting down server.{RESET}")
-        os.system("sudo poweroff")
+                bot.update_status(f"<b>Build Success ✅</b>\nBut ZIP file was not found.")
+        else:
+            bot.update_status(f"<b>Build for {device} finished: Failed ❌</b>\nCC: @zenin1504")
+            error_log = "out/error.log"
+            if os.path.exists(error_log):
+                bot.send_document(error_log, caption="Build failed error log. CC: @zenin1504")
+            
+    except KeyboardInterrupt:
+        process.terminate()
 
 if __name__ == "__main__":
     main()
